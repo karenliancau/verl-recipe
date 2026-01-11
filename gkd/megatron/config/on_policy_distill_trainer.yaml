@@ -31,7 +31,7 @@ data:
   sampler:
     class_path: null
     class_name: null
-  dataloader_num_workers: 8
+  dataloader_num_workers: 0  # Changed to 0 to avoid NPU/CPU contention
   return_multi_modal_inputs: True
 
 actor_rollout_ref:
@@ -60,6 +60,10 @@ actor_rollout_ref:
     # Whether to automatically adjust batch size at runtime
     strategy: megatron
     micro_batch_size: 2
+    # Added PPO specific params required by shared worker class
+    ppo_mini_batch_size: 1
+    router_replay:
+      mode: disabled
     megatron:
       param_offload: False
       grad_offload: False
@@ -181,10 +185,11 @@ actor_rollout_ref:
   rollout:
     _target_: verl.workers.config.RolloutConfig
     name: vllm
-    mode: sync # sync: LLM, async: AsyncLLM
+    mode: async # Changed from sync which is deprecated
     temperature: 1.0
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
     top_p: 1
+    n: 1 # Added explicit n=1
     data_parallel_size: 1
     expert_parallel_size: 1
     pipeline_model_parallel_size: 1
