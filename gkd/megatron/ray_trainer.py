@@ -323,16 +323,37 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         self.actor_rollout_wg = self.actor_wg  # to be compatible with the functions that not be modified
         weights_info = self.actor_wg.get_actor_weights_info()[0]
         self.rollout_wg.set_actor_weights_info(weights_info)
-        from ray.util.collective import collective
 
         actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers
-        collective.create_collective_group(
-            actor_rollout_workers,
-            len(actor_rollout_workers),
-            list(range(0, len(actor_rollout_workers))),
-            backend="nccl",
-            group_name="actor_rollout",
-        )
+        if self.device_name == "npu":
+            master_address = ray.get(self.actor_wg.workers[0]._get_node_ip.remote()).strip("[]")
+            master_port = ray.get(self.actor_wg.workers[0]._get_free_port.remote())
+            n_workers = len(actor_rollout_workers)
+
+            self.actor_wg.create_weight_sync_group(
+                master_address,
+                master_port,
+                0,
+                n_workers,
+            )
+            ray.get(
+                self.rollout_wg.create_weight_sync_group(
+                    master_address,
+                    master_port,
+                    len(self.actor_wg.workers),
+                    n_workers,
+                )
+            )
+        else:
+            from ray.util.collective import collective
+
+            collective.create_collective_group(
+                actor_rollout_workers,
+                len(actor_rollout_workers),
+                list(range(0, len(actor_rollout_workers))),
+                backend="nccl",
+                group_name="actor_rollout",
+            )
 
     def sync_rollout_weights(self):
         assert not self.hybrid_engine
