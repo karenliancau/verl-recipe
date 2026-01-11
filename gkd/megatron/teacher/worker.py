@@ -31,12 +31,13 @@ def main():
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--ep-size", type=int, default=1)
     parser.add_argument("--dp-size", type=int, default=1)
+    parser.add_argument("--max-num-seqs", type=int, default=32)
     args = parser.parse_args()
 
     if args.backend == "vllm":
         from vllm_engine import VLLMEngine
 
-        engine = VLLMEngine(args.ckpt_path, args.n_logprobs, args.tp_size)
+        engine = VLLMEngine(args.ckpt_path, args.n_logprobs, args.tp_size, args.max_num_seqs, args.seq_len)
     else:
         raise ValueError(f"Unknown backend: {args.backend}.")
 

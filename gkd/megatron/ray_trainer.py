@@ -25,8 +25,8 @@ import numpy as np
 import ray
 import torch
 from omegaconf import OmegaConf, open_dict
-from recipe.gkd.teacher import TeacherClient
-from recipe.gkd.teacher_utils import get_teacher_knowledge
+from recipe.gkd.megatron.teacher import TeacherClient
+from recipe.gkd.megatron.teacher_utils import get_teacher_knowledge
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
