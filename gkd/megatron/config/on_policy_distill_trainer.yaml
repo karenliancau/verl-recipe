@@ -12,7 +12,7 @@ data:
   train_files: /path/to/train.parquet
   val_files: null
   prompt_key: question
-  reward_fn_key: data_source
+  reward_fn_key: null
   max_prompt_length: 512
   max_response_length: 512
   train_batch_size: 1024
