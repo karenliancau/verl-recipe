@@ -393,8 +393,14 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         Call parameter synchronization and asynchronous sequence generation.
         """
         batch = DataProto.from_single_dict(batch_dict)
-        # pop those keys for generation
-        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        # pop those keys for generation (only if present in the batch)
+        batch_keys_to_pop = []
+        if "input_ids" in batch.batch:
+            batch_keys_to_pop.append("input_ids")
+        if "attention_mask" in batch.batch:
+            batch_keys_to_pop.append("attention_mask")
+        if "position_ids" in batch.batch:
+            batch_keys_to_pop.append("position_ids")
         non_tensor_batch_keys_to_pop = []
         if "raw_prompt_ids" in batch.non_tensor_batch:
             non_tensor_batch_keys_to_pop.append("raw_prompt_ids")
