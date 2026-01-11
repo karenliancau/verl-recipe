@@ -27,7 +27,7 @@ from megatron.core import parallel_state as mpu
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron_distill_losses import build_vocab_parallel_distill_loss
+from recipe.gkd.megatron.megatron_distill_losses import build_vocab_parallel_distill_loss
 from omegaconf import DictConfig, OmegaConf
 from torch import nn
 
@@ -89,22 +89,6 @@ class TensorBuffer:
             tensors.append((key_, self.tensor[start : start + shape_.numel()].view(shape_)))
             start += shape_.numel()
         return tensors
-
-
-class WeightSyncMixin:
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size):
-        from verl.utils.device import get_torch_device
-        from verl.experimental.one_step_off_policy.distributed_utils import vllm_stateless_init_process_group
-
-        rank = torch.distributed.get_rank() + rank_offset
-        self._weight_sync_group = vllm_stateless_init_process_group(
-            master_address,
-            master_port,
-            rank,
-            world_size,
-            get_torch_device().current_device(),
-        )
 
 
 def record_time(func):
@@ -202,7 +186,7 @@ class OnPolicyDistillActor:
         config.finalize_model_grads_func = finalize_model_grads
 
         # Build distill loss operator (selectable by config)
-        self.distill_loss_op = build_vocab_parallel_distill_loss(self.config.get("distill_loss", None)).cuda()
+        self.distill_loss_op = build_vocab_parallel_distill_loss(self.config.get("distill_loss", None)).to(get_device_id())
 
     def _validate_config(self, config) -> None:
         """Validate config options not implemented for Megatron backend"""
@@ -458,7 +442,7 @@ class OnPolicyDistillActor:
         return metrics
 
 
-class MegatronOnPolicyDistillActorWorker(ActorRolloutRefWorker, WeightSyncMixin):
+class MegatronOnPolicyDistillActorWorker(ActorRolloutRefWorker):
     """
     Actor-only worker: owns the trainable Megatron model and optimizer, performs update_actor.
     """
@@ -472,13 +456,27 @@ class MegatronOnPolicyDistillActorWorker(ActorRolloutRefWorker, WeightSyncMixin)
         super().__init__(config, role)
         assert self._is_actor and not self._is_rollout, "Actor worker must be actor-only."
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size):
+        from verl.utils.device import get_torch_device
+        from verl.experimental.one_step_off_policy.distributed_utils import vllm_stateless_init_process_group
+
+        rank = torch.distributed.get_rank() + rank_offset
+        self._weight_sync_group = vllm_stateless_init_process_group(
+            master_address,
+            master_port,
+            rank,
+            world_size,
+            get_torch_device().current_device(),
+        )
+
     def _get_actor_params_generator(self):
         assert self._is_actor
         if self.bridge is not None:
             generator = self.bridge.export_weights(self.actor.actor_module)
         else:
             # from verl.utils.megatron_utils import per_tensor_generator
-            from megatron_utils import per_tensor_generator
+            from recipe.gkd.megatron.megatron_utils import per_tensor_generator
 
             from verl.models.mcore import get_mcore_weight_converter
 
@@ -647,7 +645,7 @@ class MegatronOnPolicyDistillActorWorker(ActorRolloutRefWorker, WeightSyncMixin)
         return ret
 
 
-class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker, WeightSyncMixin):
+class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
     """
     Rollout-only worker: owns the inference engine (vLLM/SGlang, or Megatron forward) and generates sequences.
     """
@@ -726,6 +724,20 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker, WeightSyncMixi
         # self._build_rollout will use this variable
         self.bridge = "none"
         self.generation_config = get_generation_config(self.local_path)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    def create_weight_sync_group(self, master_address, master_port, rank_offset, world_size):
+        from verl.utils.device import get_torch_device
+        from verl.experimental.one_step_off_policy.distributed_utils import vllm_stateless_init_process_group
+
+        rank = torch.distributed.get_rank() + rank_offset
+        self._weight_sync_group = vllm_stateless_init_process_group(
+            master_address,
+            master_port,
+            rank,
+            world_size,
+            get_torch_device().current_device(),
+        )
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
