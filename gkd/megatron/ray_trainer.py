@@ -395,7 +395,9 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         batch = DataProto.from_single_dict(batch_dict)
         # pop those keys for generation
         batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-        non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+        non_tensor_batch_keys_to_pop = []
+        if "raw_prompt_ids" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("raw_prompt_ids")
         if "multi_modal_data" in batch.non_tensor_batch:
             non_tensor_batch_keys_to_pop.append("multi_modal_data")
         if "raw_prompt" in batch.non_tensor_batch:
