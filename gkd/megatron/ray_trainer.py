@@ -330,16 +330,14 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
             master_port = ray.get(self.actor_wg.workers[0]._get_free_port.remote())
             n_workers = len(actor_rollout_workers)
 
-            self.actor_wg.execute_all_async(
-                "create_weight_sync_group",
+            self.actor_wg.create_weight_sync_group(
                 master_address,
                 master_port,
                 0,
                 n_workers,
             )
             ray.get(
-                self.rollout_wg.execute_all_async(
-                    "create_weight_sync_group",
+                self.rollout_wg.create_weight_sync_group(
                     master_address,
                     master_port,
                     len(self.actor_wg.workers),
