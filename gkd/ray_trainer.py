@@ -167,8 +167,19 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
         self.teacher_config = self.config.actor_rollout_ref.teacher
         self.n_server_workers = self.teacher_config.n_server_workers
+        
+        # Calculate num_microbatches for TeacherClient to handle batches efficiently
+        # This prevents deadlock when processing large generation batches
+        # If not specified in config, use n_server_workers as default
+        num_microbatches = self.teacher_config.get("num_microbatches", None)
+        if num_microbatches is None:
+            num_microbatches = self.n_server_workers
+        
         self.teacher_client = TeacherClient(
-            self.teacher_config.server_ip, self.teacher_config.server_port, n_server_workers=self.n_server_workers
+            self.teacher_config.server_ip, 
+            self.teacher_config.server_port, 
+            n_server_workers=self.n_server_workers,
+            num_microbatches=num_microbatches
         )
 
         self.params_dtype = PrecisionType.to_dtype("bfloat16")
@@ -325,8 +336,27 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
 
     def sync_rollout_weights(self):
         assert not self.hybrid_engine
-        self.actor_wg.sync_rollout_weights()
-        ray.get(self.rollout_wg.sync_rollout_weights())
+        import time
+        logger.info("Starting rollout weight synchronization...")
+        start_time = time.time()
+        
+        try:
+            self.actor_wg.sync_rollout_weights()
+            logger.info("Actor weight sync completed")
+        except Exception as e:
+            logger.error(f"Actor weight sync failed: {e}")
+            raise
+        
+        try:
+            # Add timeout to prevent indefinite blocking
+            # Default Ray timeout is 30s, we set it to match the nccl_timeout from config
+            timeout = self.config.actor_rollout_ref.get("nccl_timeout", 600)
+            logger.info(f"Waiting for rollout weight sync with timeout={timeout}s...")
+            ray.get(self.rollout_wg.sync_rollout_weights(), timeout=timeout)
+            logger.info(f"Rollout weight sync completed in {time.time() - start_time:.2f}s")
+        except Exception as e:
+            logger.error(f"Rollout weight sync failed after {time.time() - start_time:.2f}s: {e}")
+            raise
 
     def _create_continuous_iterator(self):
         """
