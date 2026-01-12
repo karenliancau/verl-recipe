@@ -535,9 +535,13 @@ class vLLMRollout(BaseRollout):
             detokenize=False,
         )
 
-        # Generate using vLLM (pass original unpadded token ids)
+        # Convert prompt_token_ids to TokensPrompt format for vLLM
+        # vLLM expects prompts as list of dicts with "prompt_token_ids" key
+        token_prompts = [{"prompt_token_ids": ids} for ids in prompt_token_ids]
+
+        # Generate using vLLM
         outputs = self.inference_engine.generate(
-            prompt_token_ids=prompt_token_ids,
+            prompts=token_prompts,
             sampling_params=sampling_params,
         )
 
