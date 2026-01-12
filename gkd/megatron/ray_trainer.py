@@ -42,6 +42,7 @@ from verl.trainer.ppo.metric_utils import (
 )
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, ResourcePoolManager, Role
 from verl.utils.debug import marked_timer
+from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import (
     reduce_metrics,
 )
@@ -369,6 +370,32 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
                 group_name="actor_rollout",
             )
 
+        # Initialize AgentLoopManager for async rollout mode (vLLM/SGLang)
+        self._init_async_rollout_manager()
+
+    def _init_async_rollout_manager(self):
+        """Initialize AgentLoopManager for async rollout generation.
+
+        This is required for vLLM/SGLang async mode since the SPMD sync mode
+        was deprecated. The AgentLoopManager handles:
+        - HTTP-based communication with inference servers
+        - Tokenization via AgentLoop
+        - Batch dispatching to multiple workers
+        """
+        # Support custom AgentLoopManager via config
+        manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
+        if manager_class_fqn:
+            AgentLoopManager = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
+        else:
+            from verl.experimental.agent_loop import AgentLoopManager
+
+        self.async_rollout_manager = AgentLoopManager(
+            config=self.config,
+            worker_group=self.rollout_wg,
+            rm_resource_pool=None,  # GKD doesn't use reward model resource pool
+        )
+        logger.info("AgentLoopManager initialized for async rollout")
+
     def sync_rollout_weights(self):
         assert not self.hybrid_engine
         import time
@@ -431,40 +458,51 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
             for batch_dict in iterator:
                 yield epoch, batch_dict
 
-    def _async_gen_next_batch(self, epoch, batch_dict, sync_before_generation=True):
+    def _get_gen_batch(self, batch: DataProto) -> DataProto:
+        """Extract generation batch from input batch.
+
+        This method separates the data needed for generation from the full batch,
+        following the same pattern as RayPPOTrainer._get_gen_batch.
+
+        Args:
+            batch: Input DataProto containing all batch data
+
+        Returns:
+            DataProto containing only the keys needed for generation
         """
-        Call parameter synchronization and asynchronous sequence generation.
-        """
-        batch = DataProto.from_single_dict(batch_dict)
-        # pop those keys for generation (only if present in the batch)
+        # Keys to keep in the original batch (not pop for generation)
+        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+
+        # Pop all non-tensor keys except reward model keys for generation
         batch_keys_to_pop = []
-        if "input_ids" in batch.batch:
-            batch_keys_to_pop.append("input_ids")
-        if "attention_mask" in batch.batch:
-            batch_keys_to_pop.append("attention_mask")
-        if "position_ids" in batch.batch:
-            batch_keys_to_pop.append("position_ids")
-        non_tensor_batch_keys_to_pop = []
-        if "raw_prompt_ids" in batch.non_tensor_batch:
-            non_tensor_batch_keys_to_pop.append("raw_prompt_ids")
-        if "multi_modal_data" in batch.non_tensor_batch:
-            non_tensor_batch_keys_to_pop.append("multi_modal_data")
-        if "raw_prompt" in batch.non_tensor_batch:
-            non_tensor_batch_keys_to_pop.append("raw_prompt")
-        if "tools_kwargs" in batch.non_tensor_batch:
-            non_tensor_batch_keys_to_pop.append("tools_kwargs")
-        if "interaction_kwargs" in batch.non_tensor_batch:
-            non_tensor_batch_keys_to_pop.append("interaction_kwargs")
+        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
-            non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+            non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
         )
+
+        return gen_batch
+
+    def _async_gen_next_batch(self, epoch, batch_dict, sync_before_generation=True):
+        """
+        Call parameter synchronization and sequence generation using AgentLoopManager.
+
+        Uses AgentLoopManager for async rollout mode which handles:
+        - HTTP-based communication with vLLM/SGLang servers
+        - Tokenization via AgentLoop
+        - Batch dispatching to inference workers
+        """
+        batch = DataProto.from_single_dict(batch_dict)
+        gen_batch = self._get_gen_batch(batch)
         gen_batch.meta_info["global_steps"] = self.global_steps
-        # sync weights from actor to rollout
+
+        # sync weights from actor to rollout (AgentLoopManager handles wake_up internally)
         if sync_before_generation:
             self.sync_rollout_weights()
-        # Call non-blocking rollout (worker method registered with blocking=False)
-        gen_batch_output = self.rollout_wg.async_generate_sequences(gen_batch)
+
+        # Use AgentLoopManager for generation (handles async vLLM/SGLang mode)
+        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+
         return GenerationBatchFuture(epoch, batch, gen_batch_output)
 
     def _async_get_teacher_knowledge(self, future: GenerationBatchFuture):

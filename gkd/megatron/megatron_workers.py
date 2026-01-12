@@ -886,3 +886,30 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
     def set_actor_weights_info(self, weights_info):
         assert self._is_rollout
         self._weights_info = weights_info
+
+    # ============================ vLLM/SGLang HTTP Server Methods ============================
+    # These methods are required for AgentLoopManager to communicate with the rollout worker
+    # via HTTP server mode (async generation)
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    def get_zeromq_address(self):
+        """Get the ZeroMQ address for vLLM async communication."""
+        return self.rollout.get_zeromq_address()
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
+    async def chat_completion(self, json_request):
+        """Handle chat completion requests for SGLang."""
+        ret = await self.rollout.chat_completion(json_request)
+        return ret
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
+    async def generate(
+        self,
+        prompt_ids: list[int],
+        sampling_params: dict,
+        request_id: str,
+        image_data: list = None,
+    ) -> list[int]:
+        """Async generate method for AgentLoopManager HTTP server mode."""
+        ret = await self.rollout.generate(prompt_ids, sampling_params, request_id, image_data=image_data)
+        return ret
