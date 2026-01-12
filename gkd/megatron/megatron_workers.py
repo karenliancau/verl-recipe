@@ -651,15 +651,11 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
     """
 
     def __init__(self, config: DictConfig, role: str):
-        # Ensure we run as rollout-only worker
-        # is_struct = OmegaConf.is_struct(config) or False
-        # OmegaConf.set_struct(config, False)
-        # # Set a safe minimal rollout micro-batch size if not provided by config
-        # if OmegaConf.select(config, "actor.ppo_mini_batch_size") is None:
-        #     config.actor.ppo_mini_batch_size = 2
-        # if OmegaConf.select(config, "rollout.n") is None:
-        #     config.rollout.n = 1
-        # OmegaConf.set_struct(config, is_struct)
+        # Register GKD's custom vLLM sync rollout
+        # This must be done before _build_rollout is called
+        from verl.workers.rollout.base import _ROLLOUT_REGISTRY
+        _ROLLOUT_REGISTRY[("vllm", "sync")] = "recipe.gkd.megatron.vllm_rollout_sync.vLLMSyncRollout"
+
         import datetime
 
         from verl.utils.config import omega_conf_to_dataclass
@@ -811,9 +807,10 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
         
         rollout_name = self.config.rollout.name
         if rollout_name == "vllm":
-            inference_model = (
-                self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
-            )
+            # GKD uses vLLMSyncRollout which has self.model set to the vLLM model
+            # This is accessed via: inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+            # but we store it directly in self.rollout.model for convenience
+            inference_model = self.rollout.model
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
             patch_vllm_moe_model_weight_loader(inference_model)
@@ -886,30 +883,3 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
     def set_actor_weights_info(self, weights_info):
         assert self._is_rollout
         self._weights_info = weights_info
-
-    # ============================ vLLM/SGLang HTTP Server Methods ============================
-    # These methods are required for AgentLoopManager to communicate with the rollout worker
-    # via HTTP server mode (async generation)
-
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    def get_zeromq_address(self):
-        """Get the ZeroMQ address for vLLM async communication."""
-        return self.rollout.get_zeromq_address()
-
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
-    async def chat_completion(self, json_request):
-        """Handle chat completion requests for SGLang."""
-        ret = await self.rollout.chat_completion(json_request)
-        return ret
-
-    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
-    async def generate(
-        self,
-        prompt_ids: list[int],
-        sampling_params: dict,
-        request_id: str,
-        image_data: list = None,
-    ) -> list[int]:
-        """Async generate method for AgentLoopManager HTTP server mode."""
-        ret = await self.rollout.generate(prompt_ids, sampling_params, request_id, image_data=image_data)
-        return ret

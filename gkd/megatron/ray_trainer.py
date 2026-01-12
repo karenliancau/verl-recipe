@@ -42,7 +42,6 @@ from verl.trainer.ppo.metric_utils import (
 )
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, ResourcePoolManager, Role
 from verl.utils.debug import marked_timer
-from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.metric import (
     reduce_metrics,
 )
@@ -370,32 +369,10 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
                 group_name="actor_rollout",
             )
 
-        # Initialize AgentLoopManager for async rollout mode (vLLM/SGLang)
-        self._init_async_rollout_manager()
-
-    def _init_async_rollout_manager(self):
-        """Initialize AgentLoopManager for async vLLM/SGLang rollout.
-
-        AgentLoopManager handles:
-        - HTTP-based communication with inference servers
-        - Tokenization via AgentLoop (raw_prompt -> token ids)
-        - Multi-turn dialogue state management
-        - Tool calling and interaction
-        - Batch dispatching to multiple workers
-        """
-        # Support custom AgentLoopManager via config
-        manager_class_fqn = self.config.actor_rollout_ref.rollout.get("agent", {}).get("agent_loop_manager_class")
-        if manager_class_fqn:
-            AgentLoopManager = load_class_from_fqn(manager_class_fqn, "AgentLoopManager")
-        else:
-            from verl.experimental.agent_loop import AgentLoopManager
-
-        self.async_rollout_manager = AgentLoopManager(
-            config=self.config,
-            worker_group=self.rollout_wg,
-            rm_resource_pool=None,  # GKD doesn't use reward model resource pool
-        )
-        logger.info("AgentLoopManager initialized for async rollout")
+        # GKD uses direct rollout worker calls via rollout_wg.async_generate_sequences()
+        # because the rollout workers already have vLLM initialized with dummy_megatron format
+        # which is incompatible with AgentLoopManager (creates new vLLM HTTP servers)
+        logger.info("GKD rollout initialized (using direct rollout worker group calls)")
 
     def sync_rollout_weights(self):
         assert not self.hybrid_engine
@@ -486,13 +463,12 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
 
     def _async_gen_next_batch(self, epoch, batch_dict, sync_before_generation=True):
         """
-        Call parameter synchronization and sequence generation using AgentLoopManager.
+        Call parameter synchronization and sequence generation using direct rollout worker calls.
 
-        AgentLoopManager handles:
-        - Tokenization (raw_prompt -> token ids)
-        - HTTP-based communication with vLLM/SGLang servers
-        - Multi-turn dialogue and tool calling support
-        - Batch dispatching to inference workers
+        GKD uses separated actor and rollout workers where:
+        - Rollout workers have vLLM initialized with dummy_megatron format
+        - Weights are synchronized from actor to rollout via collective broadcast
+        - Generation is performed via async_generate_sequences on the rollout worker group
         """
         batch = DataProto.from_single_dict(batch_dict)
         gen_batch = self._get_gen_batch(batch)
@@ -502,8 +478,9 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         if sync_before_generation:
             self.sync_rollout_weights()
 
-        # AgentLoopManager handles tokenization and generation
-        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+        # Use direct rollout worker group for async generation
+        # The rollout worker's async_generate_sequences method handles generation
+        gen_batch_output = self.rollout_wg.async_generate_sequences(gen_batch)
 
         return GenerationBatchFuture(epoch, batch, gen_batch_output)
 
