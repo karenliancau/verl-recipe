@@ -167,7 +167,9 @@ class VLLMEngine:
         else:
             sampling_params = make_sampling_params()
 
-        outputs = self.llm.generate(prompt_token_ids=prompt_token_ids, sampling_params=sampling_params)
+        # Convert to TokensPrompt format for vLLM (new API)
+        token_prompts = [{"prompt_token_ids": ids} for ids in prompt_token_ids]
+        outputs = self.llm.generate(prompts=token_prompts, sampling_params=sampling_params)
 
         responses, teacher_topk_logprobs, teacher_topk_indices = [], [], []
         for output in outputs:

@@ -768,6 +768,12 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
                 actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                 metrics.update(actor_output_metrics)
 
+                # Print key metrics to console for monitoring
+                kl_loss = actor_output_metrics.get("actor/kl_loss", "N/A")
+                grad_norm = actor_output_metrics.get("actor/grad_norm", "N/A")
+                lr = actor_output_metrics.get("actor/lr", "N/A")
+                print(f"METRICS: kl_loss={kl_loss:.6f}, grad_norm={grad_norm:.4f}, lr={lr:.2e}")
+
                 # save model
                 if self.config.trainer.save_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.save_freq == 0
@@ -778,6 +784,14 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
             # Metrics and bookkeeping
             steps_duration = timing_raw["step"]
             max_steps_duration = max(max_steps_duration, steps_duration)
+
+            # Print detailed timing breakdown
+            print(f"TIMING: step={steps_duration:.2f}s, "
+                  f"sync_weights={timing_raw.get('sync_rollout_weights', 0):.2f}s, "
+                  f"wait_gen={timing_raw.get('wait_prev_gen', 0):.2f}s, "
+                  f"wait_teacher={timing_raw.get('wait_prev_prev_teacher', 0):.2f}s, "
+                  f"update_actor={timing_raw.get('update_actor', 0):.2f}s")
+
             # training metrics
             metrics["training/global_step"] = self.global_steps
             # collect metrics
