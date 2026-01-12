@@ -185,7 +185,11 @@ actor_rollout_ref:
   rollout:
     _target_: verl.workers.config.RolloutConfig
     name: vllm
-    mode: async # Keep async to pass RolloutConfig validation; GKD overrides to use sync rollout
+    # Mode controls generation behavior in vLLMRollout:
+    # - "sync": Direct batch generation via generate_sequences() only
+    # - "async": Also starts ZeroMQ server for async requests
+    # Weight sync always uses HCCL/NCCL broadcast regardless of mode setting.
+    mode: sync
     temperature: 1.0
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
     top_p: 1

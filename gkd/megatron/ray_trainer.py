@@ -439,27 +439,18 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         """Extract generation batch from input batch.
 
-        This method separates the data needed for generation from the full batch,
-        following the same pattern as RayPPOTrainer._get_gen_batch.
+        For GKD, we keep the full batch since generate_sequences will handle
+        tokenization internally from raw_prompt in non_tensor_batch.
 
         Args:
             batch: Input DataProto containing all batch data
 
         Returns:
-            DataProto containing only the keys needed for generation
+            DataProto containing data needed for generation (same as input)
         """
-        # Keys to keep in the original batch (not pop for generation)
-        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
-
-        # Pop all non-tensor keys except reward model keys for generation
-        batch_keys_to_pop = []
-        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
-        gen_batch = batch.pop(
-            batch_keys=batch_keys_to_pop,
-            non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
-        )
-
-        return gen_batch
+        # For GKD rollout, we need raw_prompt from non_tensor_batch for tokenization
+        # The rollout worker will handle tokenization and generation
+        return batch
 
     def _async_gen_next_batch(self, epoch, batch_dict, sync_before_generation=True):
         """

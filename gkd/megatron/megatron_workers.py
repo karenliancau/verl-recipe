@@ -789,18 +789,18 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
         self.gen_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.torch_random_states)
 
-        # 4. Build rollout model using our custom vLLMSyncRollout
-        log_gpu_memory_usage("Before building vLLMSyncRollout for GKD", logger=logger)
+        # 4. Build rollout model using vLLMRollout
+        log_gpu_memory_usage("Before building vLLMRollout for GKD", logger=logger)
 
-        # Import and instantiate vLLMSyncRollout directly
-        from recipe.gkd.megatron.vllm_rollout_sync import vLLMSyncRollout
+        # Import and instantiate vLLMRollout directly
+        from recipe.gkd.megatron.vllm_rollout import vLLMRollout
 
-        self.rollout = vLLMSyncRollout(
+        self.rollout = vLLMRollout(
             config=rollout_config,
             model_config=model_config,
             device_mesh=rollout_device_mesh,
         )
-        log_gpu_memory_usage("After building vLLMSyncRollout for GKD", logger=logger)
+        log_gpu_memory_usage("After building vLLMRollout for GKD", logger=logger)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -950,3 +950,23 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
     def set_actor_weights_info(self, weights_info):
         assert self._is_rollout
         self._weights_info = weights_info
+
+    def get_zeromq_address(self):
+        """Get the ZeroMQ server address if async server is enabled.
+
+        Returns:
+            str or None: The ZeroMQ address or None if not enabled
+        """
+        if hasattr(self.rollout, 'get_zeromq_address'):
+            return self.rollout.get_zeromq_address()
+        return None
+
+    def is_async_server_enabled(self):
+        """Check if async server mode is enabled.
+
+        Returns:
+            bool: True if async server is enabled
+        """
+        if hasattr(self.rollout, 'is_async_server_enabled'):
+            return self.rollout.is_async_server_enabled()
+        return False
