@@ -48,6 +48,20 @@ from verl.utils.metric import (
 from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.tracking import ValidationGenerationsLogger
 
+import logging
+
+# Module-level logger with detailed format
+logger = logging.getLogger(__name__)
+if not logger.handlers:  # Only configure if not already configured
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
 WorkerType = type[Worker]
 
 
