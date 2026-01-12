@@ -186,6 +186,10 @@ actor_rollout_ref:
     _target_: verl.workers.config.RolloutConfig
     name: vllm
     mode: async # Changed from sync which is deprecated
+    # Whether to use AgentLoopManager for generation (default: True)
+    # - True: Full-featured with tokenization, multi-turn, tool calling support
+    # - False: Lightweight AsyncLLMServerManager (requires manual tokenization, not fully implemented)
+    use_agent_loop_manager: True
     temperature: 1.0
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
     top_p: 1

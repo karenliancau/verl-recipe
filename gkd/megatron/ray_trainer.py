@@ -374,12 +374,35 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         self._init_async_rollout_manager()
 
     def _init_async_rollout_manager(self):
-        """Initialize AgentLoopManager for async rollout generation.
+        """Initialize async rollout infrastructure for vLLM/SGLang.
 
-        This is required for vLLM/SGLang async mode since the SPMD sync mode
-        was deprecated. The AgentLoopManager handles:
+        Supports two modes based on config:
+        1. AgentLoopManager (default, or when multi_turn.enable=True):
+           - Full-featured: multi-turn, tool calling, auto tokenization
+           - Required for multi-turn dialogue and tool use scenarios
+
+        2. AsyncLLMServerManager (when use_agent_loop_manager=False):
+           - Lightweight: just HTTP server + load balancing
+           - Tokenization handled manually in trainer
+           - Suitable for simple single-turn GKD training
+        """
+        # Check if we need full AgentLoopManager (multi-turn or explicitly configured)
+        multi_turn_enabled = self.config.actor_rollout_ref.rollout.get("multi_turn", {}).get("enable", False)
+        use_agent_loop = self.config.actor_rollout_ref.rollout.get("use_agent_loop_manager", True)
+
+        if multi_turn_enabled or use_agent_loop:
+            self._init_agent_loop_manager()
+        else:
+            self._init_async_server_manager()
+
+    def _init_agent_loop_manager(self):
+        """Initialize full AgentLoopManager for multi-turn and tool calling support.
+
+        AgentLoopManager handles:
         - HTTP-based communication with inference servers
-        - Tokenization via AgentLoop
+        - Tokenization via AgentLoop (raw_prompt -> token ids)
+        - Multi-turn dialogue state management
+        - Tool calling and interaction
         - Batch dispatching to multiple workers
         """
         # Support custom AgentLoopManager via config
@@ -394,7 +417,65 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
             worker_group=self.rollout_wg,
             rm_resource_pool=None,  # GKD doesn't use reward model resource pool
         )
-        logger.info("AgentLoopManager initialized for async rollout")
+        self.use_agent_loop_manager = True
+        logger.info("AgentLoopManager initialized for async rollout (multi-turn/tool support)")
+
+    def _init_async_server_manager(self):
+        """Initialize lightweight AsyncLLMServerManager for simple single-turn generation.
+
+        This sets up:
+        1. vLLMReplica/SGLangReplica to launch HTTP servers on rollout workers
+        2. AsyncLLMServerManager for load-balanced generation calls
+
+        Tokenization must be handled manually in the trainer.
+        """
+        import asyncio
+        from verl.workers.rollout.replica import get_rollout_replica_class
+        from verl.experimental.agent_loop.agent_loop import AsyncLLMServerManager
+
+        rollout_config = self.config.actor_rollout_ref.rollout
+        model_config = self.config.actor_rollout_ref.model
+
+        # Get the appropriate replica class (vLLMReplica or SGLangReplica)
+        rollout_replica_class = get_rollout_replica_class(rollout_config.name)
+
+        # Calculate number of replicas based on world size and TP
+        rollout_world_size = (
+            rollout_config.tensor_model_parallel_size
+            * rollout_config.get("data_parallel_size", 1)
+            * rollout_config.get("pipeline_model_parallel_size", 1)
+        )
+        num_replicas = self.rollout_wg.world_size // rollout_world_size
+
+        # Create rollout replicas and launch HTTP servers
+        self.rollout_replicas = [
+            rollout_replica_class(
+                replica_rank=replica_rank,
+                config=rollout_config,
+                model_config=model_config,
+                gpus_per_node=self.config.trainer.n_gpus_per_node,
+            )
+            for replica_rank in range(num_replicas)
+        ]
+
+        # Initialize replicas with existing rollout workers (hybrid mode)
+        async def init_replicas():
+            await asyncio.gather(*[
+                replica.init_hybrid(self.rollout_wg) for replica in self.rollout_replicas
+            ])
+
+        asyncio.run(init_replicas())
+
+        # Collect server handles for AsyncLLMServerManager
+        server_handles = [replica.server_handle for replica in self.rollout_replicas]
+
+        # Create lightweight server manager for load-balanced generation
+        self.async_server_manager = AsyncLLMServerManager(
+            config=self.config,
+            server_handles=server_handles,
+        )
+        self.use_agent_loop_manager = False
+        logger.info(f"AsyncLLMServerManager initialized with {len(server_handles)} servers (lightweight mode)")
 
     def sync_rollout_weights(self):
         assert not self.hybrid_engine
@@ -485,25 +566,99 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
 
     def _async_gen_next_batch(self, epoch, batch_dict, sync_before_generation=True):
         """
-        Call parameter synchronization and sequence generation using AgentLoopManager.
+        Call parameter synchronization and sequence generation.
 
-        Uses AgentLoopManager for async rollout mode which handles:
-        - HTTP-based communication with vLLM/SGLang servers
-        - Tokenization via AgentLoop
-        - Batch dispatching to inference workers
+        Supports two modes:
+        1. AgentLoopManager mode (use_agent_loop_manager=True):
+           - Handles tokenization, multi-turn, tool calling
+           - Input: raw_prompt in non_tensor_batch
+
+        2. AsyncLLMServerManager mode (use_agent_loop_manager=False):
+           - Lightweight, tokenization done here
+           - Input: raw_prompt tokenized to prompt_ids
         """
         batch = DataProto.from_single_dict(batch_dict)
         gen_batch = self._get_gen_batch(batch)
         gen_batch.meta_info["global_steps"] = self.global_steps
 
-        # sync weights from actor to rollout (AgentLoopManager handles wake_up internally)
+        # sync weights from actor to rollout
         if sync_before_generation:
             self.sync_rollout_weights()
 
-        # Use AgentLoopManager for generation (handles async vLLM/SGLang mode)
-        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+        if self.use_agent_loop_manager:
+            # AgentLoopManager handles tokenization and generation
+            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+        else:
+            # AsyncLLMServerManager: need to tokenize and call generate manually
+            gen_batch_output = self._generate_with_async_server(gen_batch)
 
         return GenerationBatchFuture(epoch, batch, gen_batch_output)
+
+    def _generate_with_async_server(self, gen_batch: DataProto) -> DataProto:
+        """Generate sequences using lightweight AsyncLLMServerManager.
+
+        This method handles tokenization manually and calls the async server
+        for generation. Used when use_agent_loop_manager=False.
+
+        Args:
+            gen_batch: DataProto with raw_prompt in non_tensor_batch
+
+        Returns:
+            DataProto with generated sequences
+        """
+        import asyncio
+        from uuid import uuid4
+
+        # Extract raw prompts and tokenize
+        raw_prompts = gen_batch.non_tensor_batch.get("raw_prompt", [])
+
+        # Prepare sampling params from config
+        rollout_config = self.config.actor_rollout_ref.rollout
+        sampling_params = {
+            "temperature": gen_batch.meta_info.get("temperature", rollout_config.temperature),
+            "top_p": gen_batch.meta_info.get("top_p", rollout_config.get("top_p", 1.0)),
+            "top_k": gen_batch.meta_info.get("top_k", rollout_config.get("top_k", -1)),
+            "max_tokens": rollout_config.response_length,
+            "n": rollout_config.get("n", 1),
+        }
+
+        async def generate_batch():
+            tasks = []
+            for i, raw_prompt in enumerate(raw_prompts):
+                # Tokenize using trainer's tokenizer
+                prompt_ids = self.tokenizer.apply_chat_template(
+                    raw_prompt,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                )
+                request_id = uuid4().hex
+
+                # Create async generation task
+                task = self.async_server_manager.generate(
+                    request_id=request_id,
+                    prompt_ids=prompt_ids,
+                    sampling_params=sampling_params,
+                )
+                tasks.append((i, prompt_ids, task))
+
+            # Gather all results
+            results = []
+            for i, prompt_ids, task in tasks:
+                output = await task
+                results.append((i, prompt_ids, output))
+
+            return results
+
+        # Run async generation
+        _ = asyncio.run(generate_batch())
+
+        # Convert results to DataProto format
+        # TODO: Implement proper DataProto construction from generation results
+        # This requires building input_ids, attention_mask, responses, etc.
+        raise NotImplementedError(
+            "AsyncLLMServerManager mode requires implementing DataProto construction. "
+            "For now, please use use_agent_loop_manager=True (default)."
+        )
 
     def _async_get_teacher_knowledge(self, future: GenerationBatchFuture):
         """Asynchronously obtain teacher model knowledge for generated sequences.
