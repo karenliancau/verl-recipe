@@ -802,6 +802,13 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
 
         assert self._is_rollout and not self.config.hybrid_engine
         assert hasattr(self, "_weights_info") and self._weights_info is not None
+        
+        # In async mode, check if inference engine is initialized
+        # It may not be ready yet on first call, so skip weight sync and let it sync on next batch
+        if self.rollout.inference_engine is None:
+            logger.warning("Rollout inference engine not yet initialized, skipping weight sync")
+            return
+        
         rollout_name = self.config.rollout.name
         if rollout_name == "vllm":
             inference_model = (

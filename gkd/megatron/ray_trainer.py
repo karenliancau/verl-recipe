@@ -387,8 +387,37 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
             # Default Ray timeout is 30s, we set it to match the nccl_timeout from config
             timeout = self.config.actor_rollout_ref.get("nccl_timeout", 600)
             logger.info(f"Waiting for rollout weight sync with timeout={timeout}s...")
-            ray.get(self.rollout_wg.sync_rollout_weights(), timeout=timeout)
-            logger.info(f"Rollout weight sync completed in {time.time() - start_time:.2f}s")
+            
+            # In async mode, the inference engine might not be initialized yet
+            # Retry for up to 20 minutes with 10-second intervals
+            # This allows time for models to load completely, especially for large models
+            retry_count = 0
+            max_retries = 120  # 120 retries * 10 seconds = 20 minutes
+            retry_timeout = 5  # Small timeout per retry to fail-fast if engine not ready
+            retry_interval = 10  # Wait 10 seconds between retries
+            
+            while retry_count < max_retries:
+                try:
+                    ray.get(self.rollout_wg.sync_rollout_weights(), timeout=retry_timeout)
+                    logger.info(f"Rollout weight sync completed in {time.time() - start_time:.2f}s")
+                    return
+                except Exception as e:
+                    retry_count += 1
+                    error_msg = str(e)
+                    # Check if the error is due to uninitialized inference engine
+                    if "'NoneType' object has no attribute" in error_msg and retry_count < max_retries:
+                        elapsed_time = time.time() - start_time
+                        logger.warning(
+                            f"Rollout inference engine not yet initialized (attempt {retry_count}/{max_retries}, "
+                            f"elapsed: {elapsed_time:.1f}s), waiting {retry_interval}s before retry..."
+                        )
+                        time.sleep(retry_interval)
+                        continue
+                    else:
+                        # For other errors or max retries reached, raise the exception
+                        if retry_count >= max_retries:
+                            logger.error(f"Rollout weight sync failed after {max_retries} retries ({time.time() - start_time:.1f}s): {e}")
+                        raise
         except Exception as e:
             logger.error(f"Rollout weight sync failed after {time.time() - start_time:.2f}s: {e}")
             raise
