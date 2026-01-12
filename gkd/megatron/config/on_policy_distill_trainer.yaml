@@ -288,6 +288,12 @@ actor_rollout_ref:
     overlap_rollout: False
     n_server_workers: 1
 
+# Reward model config (required by AgentLoopManager, disabled for GKD)
+reward_model:
+  enable: False
+  enable_resource_pool: False
+  use_reward_loop: False
+
 trainer:
   balance_batch: True
   total_epochs: 30
