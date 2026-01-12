@@ -42,6 +42,13 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _get_config_value(config, key, default=None):
+    """Helper to get config value from either OmegaConf or dataclass."""
+    if hasattr(config, "get"):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
 class vLLMSyncRollout(BaseRollout):
     """Synchronous vLLM rollout using the LLM class for batch generation.
 
@@ -54,16 +61,16 @@ class vLLMSyncRollout(BaseRollout):
 
     def __init__(
         self,
-        config: RolloutConfig,
+        config,  # Can be RolloutConfig dataclass or OmegaConf DictConfig
         model_config: HFModelConfig,
         device_mesh: DeviceMesh,
     ):
-        super().__init__(config, model_config, device_mesh)
+        # Don't call super().__init__ with strict type checking since config might be OmegaConf
         self.config = config
         self.model_config = model_config
         self.device_mesh = device_mesh
 
-        if config.layered_summon:
+        if _get_config_value(config, "layered_summon", False):
             self.sleep_level = 1
         else:
             self.sleep_level = VLLM_SLEEP_LEVEL
@@ -76,11 +83,15 @@ class vLLMSyncRollout(BaseRollout):
         self.tokenizer = tokenizer
         self.pad_token_id = tokenizer.pad_token_id
 
-        tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
+        tensor_parallel_size = _get_config_value(config, "tensor_model_parallel_size", 1)
         assert tensor_parallel_size <= torch.distributed.get_world_size(), (
             "tensor parallel size should be less than or equal to the world size"
         )
-        max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
+        max_num_batched_tokens = _get_config_value(config, "max_num_batched_tokens", 8192)
+
+        # Get config values using helper function
+        prompt_length = _get_config_value(config, "prompt_length", 512)
+        response_length = _get_config_value(config, "response_length", 512)
 
         # Handle rope scaling configuration
         rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
@@ -98,82 +109,102 @@ class vLLMSyncRollout(BaseRollout):
                 max_position_embeddings = model_hf_config.text_config.max_position_embeddings
             if max_position_embeddings is None:
                 raise ValueError("max_position_embeddings not found in model_hf_config")
-            assert max_position_embeddings >= config.prompt_length + config.response_length, (
+            assert max_position_embeddings >= prompt_length + response_length, (
                 "model context length should be greater than total sequence length"
             )
         else:
             rope_scaling_factor = rope_scaling_config.get("factor", 1.0)
             assert (
                 model_hf_config.max_position_embeddings * rope_scaling_factor
-                >= config.prompt_length + config.response_length
+                >= prompt_length + response_length
             ), (
                 "model context length should be greater than total sequence length, "
                 + f"got rope_scaling_factor={rope_scaling_factor} and "
                 + f"max_position_embeddings={model_hf_config.max_position_embeddings}"
             )
 
-        max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
+        max_model_len = int(_get_config_value(config, "max_model_len") or prompt_length + response_length)
 
         # Use dummy load format for Megatron weight sync
-        load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
+        load_format_raw = _get_config_value(config, "load_format", "dummy")
+        load_format = "dummy" if load_format_raw.startswith("dummy") else load_format_raw
 
         # Copy engine kwargs to avoid secretly modifying the engine config
-        engine_kwargs = config.get("engine_kwargs", {}).get("vllm", {}) or {}
-        engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        engine_kwargs_raw = _get_config_value(config, "engine_kwargs", {})
+        if engine_kwargs_raw:
+            engine_kwargs = _get_config_value(engine_kwargs_raw, "vllm", {}) or {}
+            engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        else:
+            engine_kwargs = {}
 
-        if config.get("limit_images", None):
-            engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
+        limit_images = _get_config_value(config, "limit_images")
+        if limit_images:
+            engine_kwargs["limit_mm_per_prompt"] = {"image": limit_images}
 
         compilation_config = {}
-        cudagraph_capture_sizes = config.get("cudagraph_capture_sizes")
-        if not config.enforce_eager and cudagraph_capture_sizes:
-            if isinstance(cudagraph_capture_sizes, ListConfig):
+        cudagraph_capture_sizes = _get_config_value(config, "cudagraph_capture_sizes")
+        enforce_eager = _get_config_value(config, "enforce_eager", True)
+        if not enforce_eager and cudagraph_capture_sizes:
+            if isinstance(cudagraph_capture_sizes, (list, ListConfig)):
                 compilation_config["compilation_config"] = CompilationConfig(
-                    level=CompilationLevel.PIECEWISE, cudagraph_capture_sizes=cudagraph_capture_sizes
+                    level=CompilationLevel.PIECEWISE, cudagraph_capture_sizes=list(cudagraph_capture_sizes)
                 )
             else:
                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
+
+        # Get remaining config values
+        dtype = _get_config_value(config, "dtype", "bfloat16")
+        gpu_memory_utilization = _get_config_value(config, "gpu_memory_utilization", 0.5)
+        max_num_seqs = _get_config_value(config, "max_num_seqs", 1024)
+        disable_log_stats = _get_config_value(config, "disable_log_stats", True)
+        enable_chunked_prefill = _get_config_value(config, "enable_chunked_prefill", False)
+        seed = _get_config_value(config, "seed", 0)
 
         # Initialize vLLM LLM engine
         self.inference_engine = LLM(
             model=model_path,
             tensor_parallel_size=tensor_parallel_size,
             distributed_executor_backend="external_launcher",
-            dtype=config.dtype,
-            enforce_eager=config.enforce_eager,
-            gpu_memory_utilization=config.gpu_memory_utilization,
+            dtype=dtype,
+            enforce_eager=enforce_eager,
+            gpu_memory_utilization=gpu_memory_utilization,
             disable_custom_all_reduce=True,
             skip_tokenizer_init=False,
             max_model_len=max_model_len,
-            max_num_seqs=config.max_num_seqs,
+            max_num_seqs=max_num_seqs,
             load_format=load_format,
-            disable_log_stats=config.disable_log_stats,
+            disable_log_stats=disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
-            enable_chunked_prefill=config.enable_chunked_prefill,
+            enable_chunked_prefill=enable_chunked_prefill,
             enable_prefix_caching=False,
             trust_remote_code=trust_remote_code,
-            seed=config.get("seed", 0),
+            seed=seed,
             **compilation_config,
             **engine_kwargs,
         )
 
         # Build default sampling params
+        temperature = _get_config_value(config, "temperature", 1.0)
+        top_p = _get_config_value(config, "top_p", 1.0)
+        top_k = _get_config_value(config, "top_k", -1)
+        repetition_penalty = _get_config_value(config, "repetition_penalty", 1.0)
+
         kwargs = dict(
             n=1,
             logprobs=0,
-            max_tokens=config.response_length,
-            repetition_penalty=config.get("repetition_penalty", 1.0),
+            max_tokens=response_length,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k if top_k > 0 else -1,
+            repetition_penalty=repetition_penalty,
             detokenize=False,
         )
 
-        # Add sampling params from config
-        for k in config.keys():
-            if hasattr(SamplingParams(), str(k)) and k != "seed":
-                kwargs[k] = config.get(k)
-        kwargs["n"] = 1  # already repeat in ray_trainer
-
         logger.info(f"vLLM sync rollout sampling kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
+
+        # Store config values for generate_sequences
+        self.response_length = response_length
 
         # Store model reference for weight updates
         self.model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
@@ -200,10 +231,10 @@ class vLLMSyncRollout(BaseRollout):
         pad_token_id = prompts.meta_info.get("pad_token_id", self.tokenizer.pad_token_id)
 
         # Get sampling parameters from meta_info or use defaults
-        temperature = prompts.meta_info.get("temperature", self.config.temperature)
-        response_length = prompts.meta_info.get("response_length", self.config.response_length)
-        top_p = prompts.meta_info.get("top_p", self.config.get("top_p", 1.0))
-        top_k = prompts.meta_info.get("top_k", self.config.get("top_k", -1))
+        temperature = prompts.meta_info.get("temperature", _get_config_value(self.config, "temperature", 1.0))
+        response_length = prompts.meta_info.get("response_length", self.response_length)
+        top_p = prompts.meta_info.get("top_p", _get_config_value(self.config, "top_p", 1.0))
+        top_k = prompts.meta_info.get("top_k", _get_config_value(self.config, "top_k", -1))
 
         # Create sampling params
         sampling_params = SamplingParams(
@@ -296,8 +327,3 @@ class vLLMSyncRollout(BaseRollout):
     async def release(self):
         """Release weights and kv cache in GPU memory."""
         pass  # Not needed for sync mode
-
-
-# Register the sync rollout
-from verl.workers.rollout.base import _ROLLOUT_REGISTRY
-_ROLLOUT_REGISTRY[("vllm", "sync")] = "recipe.gkd.megatron.vllm_rollout_sync.vLLMSyncRollout"

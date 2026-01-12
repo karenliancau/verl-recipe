@@ -185,7 +185,7 @@ actor_rollout_ref:
   rollout:
     _target_: verl.workers.config.RolloutConfig
     name: vllm
-    mode: sync # vLLM sync mode for GKD (uses LLM.generate directly)
+    mode: async # Keep async to pass RolloutConfig validation; GKD overrides to use sync rollout
     temperature: 1.0
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
     top_p: 1

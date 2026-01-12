@@ -648,14 +648,12 @@ class MegatronOnPolicyDistillActorWorker(ActorRolloutRefWorker):
 class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
     """
     Rollout-only worker: owns the inference engine (vLLM/SGlang, or Megatron forward) and generates sequences.
+
+    GKD uses a custom vLLMSyncRollout that supports synchronous batch generation with the LLM class,
+    which is compatible with dummy_megatron weight synchronization from the Megatron actor.
     """
 
     def __init__(self, config: DictConfig, role: str):
-        # Register GKD's custom vLLM sync rollout
-        # This must be done before _build_rollout is called
-        from verl.workers.rollout.base import _ROLLOUT_REGISTRY
-        _ROLLOUT_REGISTRY[("vllm", "sync")] = "recipe.gkd.megatron.vllm_rollout_sync.vLLMSyncRollout"
-
         import datetime
 
         from verl.utils.config import omega_conf_to_dataclass
@@ -734,6 +732,75 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
             world_size,
             get_torch_device().current_device(),
         )
+
+    def _build_rollout(self, trust_remote_code=False):
+        """Override parent's _build_rollout to use vLLMSyncRollout for GKD.
+
+        GKD requires synchronous batch generation with the vLLM LLM class because:
+        1. vLLMAsyncRollout doesn't support generate_sequences() (SPMD mode retired)
+        2. AgentLoopManager is incompatible with dummy_megatron weight sync
+        3. vLLMSyncRollout uses LLM.generate() which supports batch sync generation
+
+        Args:
+            trust_remote_code: Whether to trust remote code when loading the model.
+        """
+        from torch.distributed.device_mesh import init_device_mesh
+
+        from verl.utils.config import omega_conf_to_dataclass
+        from verl.workers.config import HFModelConfig
+
+        # 1. Parse rollout and huggingface model config
+        # Note: We pass the raw OmegaConf config to vLLMSyncRollout
+        # which handles attribute access via OmegaConf's dot notation
+        rollout_config = self.config.rollout
+
+        # Convert model config to HFModelConfig dataclass
+        model_config_dict = OmegaConf.to_container(self.config.model)
+        model_config_dict.pop("lora", None)
+        model_config_dict["trust_remote_code"] = trust_remote_code
+        model_config: HFModelConfig = omega_conf_to_dataclass(
+            OmegaConf.create(model_config_dict), dataclass_type=HFModelConfig
+        )
+
+        # 2. Build rollout device mesh
+        infer_tp = self.config.rollout.tensor_model_parallel_size * self.config.rollout.data_parallel_size
+        infer_pp = self.config.rollout.pipeline_model_parallel_size
+        infer_world_size = infer_tp * infer_pp
+        dp = self.world_size // infer_world_size
+        assert self.world_size % infer_world_size == 0, (
+            f"rollout world_size: {self.world_size} is not divisible by infer_world_size: {infer_world_size}"
+        )
+        rollout_device_mesh = init_device_mesh(
+            get_device_name(), mesh_shape=(dp, infer_tp, infer_pp), mesh_dim_names=["dp", "infer_tp", "infer_pp"]
+        )
+
+        is_collect = (
+            rollout_device_mesh["infer_tp"].get_local_rank() == 0
+            and rollout_device_mesh["infer_pp"].get_local_rank() == 0
+        )
+        self._register_dispatch_collect_info(
+            "rollout", dp_rank=rollout_device_mesh["dp"].get_local_rank(), is_collect=is_collect
+        )
+
+        # 3. Init trainer and rollout random states
+        self.torch_random_states = get_torch_device().get_rng_state()
+        gen_dp_rank = rollout_device_mesh["dp"].get_local_rank()
+        get_torch_device().manual_seed(gen_dp_rank + 1000)
+        self.gen_random_states = get_torch_device().get_rng_state()
+        get_torch_device().set_rng_state(self.torch_random_states)
+
+        # 4. Build rollout model using our custom vLLMSyncRollout
+        log_gpu_memory_usage("Before building vLLMSyncRollout for GKD", logger=logger)
+
+        # Import and instantiate vLLMSyncRollout directly
+        from recipe.gkd.megatron.vllm_rollout_sync import vLLMSyncRollout
+
+        self.rollout = vLLMSyncRollout(
+            config=rollout_config,
+            model_config=model_config,
+            device_mesh=rollout_device_mesh,
+        )
+        log_gpu_memory_usage("After building vLLMSyncRollout for GKD", logger=logger)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
