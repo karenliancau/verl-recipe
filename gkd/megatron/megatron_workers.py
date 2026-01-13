@@ -218,7 +218,8 @@ class OnPolicyDistillActor:
         #     group=mpu.get_pipeline_model_parallel_group(),
         # )
         # split into micro-batches
-        data.batch["attention_mask"] = data.batch["attention_mask"].to(bool)
+        # Use set_() for in-place modification to avoid TensorDict lock error
+        data.batch.set_("attention_mask", data.batch["attention_mask"].to(bool))
 
         indices = None
         if use_dynamic_bsz:
@@ -861,16 +862,31 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def sync_rollout_weights(self):
+        import time
         from ray.util.collective import collective
 
         assert self._is_rollout and not self.config.hybrid_engine
         assert hasattr(self, "_weights_info") and self._weights_info is not None
-        
-        # In async mode, check if inference engine is initialized
-        # It may not be ready yet on first call, so skip weight sync and let it sync on next batch
-        if self.rollout.inference_engine is None:
-            logger.warning("Rollout inference engine not yet initialized, skipping weight sync")
-            return
+
+        # Wait for inference engine to be initialized before syncing weights
+        # This is critical - if we skip weight sync, the model will generate garbage
+        max_wait_time = 300  # Maximum wait time in seconds
+        wait_interval = 0.5  # Check interval in seconds
+        waited_time = 0
+        while self.rollout.inference_engine is None:
+            if waited_time >= max_wait_time:
+                raise RuntimeError(
+                    f"Rollout inference engine not initialized after {max_wait_time}s. "
+                    "Weight sync cannot proceed. Please check if the inference engine is properly configured."
+                )
+            logger.warning(
+                f"Rollout inference engine not yet initialized, waiting... ({waited_time:.1f}s/{max_wait_time}s)"
+            )
+            time.sleep(wait_interval)
+            waited_time += wait_interval
+
+        if waited_time > 0:
+            logger.info(f"Rollout inference engine initialized after {waited_time:.1f}s, proceeding with weight sync")
         
         rollout_name = self.config.rollout.name
         if rollout_name == "vllm":
