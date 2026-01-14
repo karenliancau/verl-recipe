@@ -259,10 +259,13 @@ class OnPolicyDistillActor:
                     response_length = responses.size(1)
                     calc_kl_mask = mb["attention_mask"].clone()
                     calc_kl_mask[:, : (-response_length - 1)] = False
+                    # Unlock TensorDict to allow adding new keys
+                    mb.unlock_()
                     mb["calc_kl_mask"] = calc_kl_mask
                     mb["kl_losses"] = torch.zeros_like(calc_kl_mask, dtype=torch.float32)
                     mb["teacher_topk_logps"] = teacher_topk_logps[i].pin_memory()
                     mb["teacher_topk_indices"] = teacher_topk_indices[i].pin_memory()
+                    mb.lock_()
         else:
             assert micro_batch_size is not None, (
                 "micro_batch_size is needed to be passed in when not using dynamic batch size"
@@ -278,10 +281,13 @@ class OnPolicyDistillActor:
                     response_length = responses.size(1)
                     calc_kl_mask = mb["attention_mask"].clone()
                     calc_kl_mask[:, : (-response_length - 1)] = False
+                    # Unlock TensorDict to allow adding new keys
+                    mb.unlock_()
                     mb["calc_kl_mask"] = calc_kl_mask
                     mb["kl_losses"] = torch.zeros_like(calc_kl_mask, dtype=torch.float32)
                     mb["teacher_topk_logps"] = torch.tensor(teacher_topk_logps[i]).pin_memory()
                     mb["teacher_topk_indices"] = torch.tensor(teacher_topk_indices[i]).pin_memory()
+                    mb.lock_()
 
         # compute input shapes for pp stages
         n_micro_batch = len(micro_batches)
@@ -596,10 +602,15 @@ class MegatronOnPolicyDistillActorWorker(ActorRolloutRefWorker):
         tensor_buffer = TensorBuffer(update_weights_bucket_bytes, self.param_dtype)
         device_name = get_device_name()
 
+        total_params = len(self._weights_info)
+        synced_params = 0
+
+        logger.info(f"[Actor] Starting weight sync for {total_params} parameters...")
+
         for key, shape, dtype in self._weights_info:
             weight_key, weight = next(params_generator)
-            assert key == weight_key
-            assert shape == weight.size()
+            assert key == weight_key, f"Key mismatch: expected {key}, got {weight_key}"
+            assert shape == weight.size(), f"Shape mismatch for {key}: expected {shape}, got {weight.size()}"
             try:
                 assert dtype == weight.dtype
             except AssertionError:
@@ -612,6 +623,9 @@ class MegatronOnPolicyDistillActorWorker(ActorRolloutRefWorker):
                     self._weight_sync_group.broadcast(weight, src=0, stream=get_torch_device().current_stream())
                 else:
                     collective.broadcast(weight, src_rank=0, group_name="actor_rollout")
+                # Synchronize to ensure broadcast is complete
+                get_torch_device().synchronize()
+                synced_params += 1
             else:
                 if tensor_buffer.size + shape.numel() > tensor_buffer.capacity:
                     if device_name == "npu":
@@ -620,6 +634,9 @@ class MegatronOnPolicyDistillActorWorker(ActorRolloutRefWorker):
                         )
                     else:
                         collective.broadcast(tensor_buffer.tensor, src_rank=0, group_name="actor_rollout")
+                    # Synchronize to ensure broadcast is complete
+                    get_torch_device().synchronize()
+                    synced_params += len(tensor_buffer.keys)
                     tensor_buffer.clear()
                 tensor_buffer.append(key, shape, weight)
         if tensor_buffer.size > 0:
@@ -629,7 +646,12 @@ class MegatronOnPolicyDistillActorWorker(ActorRolloutRefWorker):
                 )
             else:
                 collective.broadcast(tensor_buffer.tensor, src_rank=0, group_name="actor_rollout")
+            # Synchronize to ensure broadcast is complete
+            get_torch_device().synchronize()
+            synced_params += len(tensor_buffer.keys)
             tensor_buffer.clear()
+
+        logger.info(f"[Actor] Weight sync completed: synced {synced_params}/{total_params} parameters")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_actor_weights_info(self):
@@ -641,6 +663,11 @@ class MegatronOnPolicyDistillActorWorker(ActorRolloutRefWorker):
         ret = []
         for key, tensor in params_generator:
             ret.append((key, tensor.size(), tensor.dtype))
+
+        if not ret:
+            logger.warning("get_actor_weights_info found NO parameters! Check model initialization and layer_name_mapping.")
+        else:
+            logger.info(f"get_actor_weights_info found {len(ret)} parameters. First: {ret[0][0]}")
 
         self._weights_info = ret
         return ret
@@ -925,7 +952,11 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
         tensor_buffer = TensorBuffer(update_weights_bucket_bytes, self.param_dtype)
         device_name = get_device_name()
 
+        total_params = len(self._weights_info)
+        loaded_params = 0
+
         def group_tensor_generator():
+            nonlocal loaded_params
             for key, shape, dtype in self._weights_info:
                 assert dtype == self.param_dtype, key
                 if shape.numel() > tensor_buffer.capacity:
@@ -934,6 +965,9 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
                         self._weight_sync_group.broadcast(tensor, src=0, stream=get_torch_device().current_stream())
                     else:
                         collective.broadcast(tensor, src_rank=0, group_name="actor_rollout")
+                    # Synchronize to ensure broadcast is complete before using tensor
+                    get_torch_device().synchronize()
+                    loaded_params += 1
                     yield [(key, tensor)]
                 else:
                     if tensor_buffer.size + shape.numel() > tensor_buffer.capacity:
@@ -943,6 +977,10 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
                             )
                         else:
                             collective.broadcast(tensor_buffer.tensor, src_rank=0, group_name="actor_rollout")
+                        # Synchronize to ensure broadcast is complete before using tensor
+                        get_torch_device().synchronize()
+                        batch_size = len(tensor_buffer.keys)
+                        loaded_params += batch_size
                         yield tensor_buffer.to_tensors()
                         tensor_buffer.clear()
                     tensor_buffer.append(key, shape)
@@ -953,14 +991,21 @@ class MegatronOnPolicyDistillRolloutWorker(ActorRolloutRefWorker):
                     )
                 else:
                     collective.broadcast(tensor_buffer.tensor, src_rank=0, group_name="actor_rollout")
+                # Synchronize to ensure broadcast is complete before using tensor
+                get_torch_device().synchronize()
+                batch_size = len(tensor_buffer.keys)
+                loaded_params += batch_size
                 yield tensor_buffer.to_tensors()
                 tensor_buffer.clear()
 
+        logger.info(f"Starting weight sync for {total_params} parameters...")
         for tensors in group_tensor_generator():
             if rollout_name == "vllm":
                 inference_model.load_weights(tensors)
             elif rollout_name == "sglang":
                 loop.run_until_complete(update_weights(inference_model, tensors))
+
+        logger.info(f"Weight sync completed: loaded {loaded_params}/{total_params} parameters")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_actor_weights_info(self, weights_info):

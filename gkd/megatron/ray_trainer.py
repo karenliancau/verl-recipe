@@ -338,6 +338,12 @@ class OnPolicyDistillTrainer(RayPPOTrainer):
         weights_info = self.actor_wg.get_actor_weights_info()[0]
         self.rollout_wg.set_actor_weights_info(weights_info)
 
+        logger.info(f"Actor weights info retrieved: {len(weights_info)} tensors")
+        if len(weights_info) > 0:
+            logger.info(f"First tensor: {weights_info[0]}")
+        else:
+            logger.warning("Actor weights info is empty! Check model initialization.")
+
         actor_rollout_workers = self.actor_wg.workers + self.rollout_wg.workers
         if self.device_name == "npu":
             master_address = ray.get(self.actor_wg.workers[0]._get_node_ip.remote()).strip("[]")
